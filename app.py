@@ -93,7 +93,7 @@ Describe visible action and camera movement. Do not request text, subtitles,
 logos, or watermarks. Do not include markdown fences.
 """
     response = client.chat.completions.create(
-        model="llama-3.3-70b-versatile",
+        model="openai/gpt-oss-120b",
         messages=[{"role": "user", "content": instructions}],
         temperature=0.65,
     )
