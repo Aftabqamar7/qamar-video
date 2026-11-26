@@ -179,7 +179,8 @@ def generate_veo_clip(
         },
     }
 
-response = session.post(endpoint, json=request_body, timeout=120)
+    response = session.post(endpoint, json=request_body, timeout=120)
+
     if response.status_code >= 400:
         raise RuntimeError(
             f"Google Veo request failed ({response.status_code}): {response.text[:1800]}"
