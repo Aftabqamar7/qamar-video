@@ -1,4 +1,7 @@
+
 streamlit>=1.40.0
 groq>=0.11.0
+fal-client
 requests>=2.32.0
 imageio-ffmpeg>=0.5.1
+
