@@ -241,7 +241,8 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                 "Groq returned invalid JSON. Try again, or leave the Groq key blank "
                 "to use automatic scene prompts."
             )
-         except Exception as error:
+            
+        except Exception as error:
             st.error(f"Video generation failed: {error}")
             st.info(
                 "Check that your Gemini API key has Veo access, the selected model is "
