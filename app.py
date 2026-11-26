@@ -164,16 +164,18 @@ def assemble_video(clip_paths, output_path, seconds, quality, portrait):
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         command = [
-            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+            ffmpeg,
+            "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
             "-t", str(seconds),
-            "-vf", f"scale={size}:force_original_aspect_ratio=decrease,"
-                   f"pad={size}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-vf",
+            f"scale={size}:force_original_aspect_ratio=decrease,"
+            f"pad={size}:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r", "24", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", str(output_path)
+            "-movflags", "+faststart", str(output_path),
         ]
-      result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode:
+        result = subprocess.run(command, capture_output=True, text=True)
+        if result.returncode != 0:
             raise RuntimeError("FFmpeg export failed: " + result.stderr[-2000:])
 
 if st.button("🚀 Generate my video", type="primary", use_container_width=True):
@@ -239,7 +241,7 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                 "Groq returned invalid JSON. Try again, or leave the Groq key blank "
                 "to use automatic scene prompts."
             )
-        except Exception as error:
+         except Exception as error:
             st.error(f"Video generation failed: {error}")
             st.info(
                 "Check that your Gemini API key has Veo access, the selected model is "
@@ -254,3 +256,5 @@ with st.expander("Important details before deployment"):
 - **1080p** is requested from Veo. **2K** is an upscale to 2560×1440 (landscape) or 1440×2560 (portrait), not native 2K generation.
 - Video generation may incur API charges and take several minutes per clip.
 - Streamlit Cloud has resource and execution limits. Long-running generations may time out; a production app may need a background worker and object storage.
+- Never place API keys in source code or commit them to GitHub.
+""")   
