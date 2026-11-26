@@ -333,7 +333,7 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                 assemble_video(clips, final_path, duration, export_quality, portrait)
                 video_data = final_path.read_bytes()
 
-progress.progress(1.0)
+            progress.progress(1.0)
             status.success(f"Your {duration}-second video is ready!")
             st.video(video_data)
             st.download_button(
