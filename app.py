@@ -7,8 +7,11 @@ import time
 from pathlib import Path
 
 import streamlit as st
-from google import genai
-from google.genai import types
+import uuid
+import requests
+from google.oauth2 import service_account
+from google.auth.transport.requests import AuthorizedSession
+from google.cloud import storage
 from groq import Groq
 
 st.set_page_config(page_title="PromptVideo Studio", page_icon="🎬", layout="wide")
@@ -30,22 +33,31 @@ st.markdown(
 )
 
 st.warning(
-    "Google Veo (through the Gemini API) generates the actual video. "
-    "Groq optionally plans the scenes; Groq itself does not generate video."
+    "Veo video generation in this workflow uses Google Cloud Gemini Enterprise Agent Platform "
+    "(Vertex AI authentication), not a standard Google AI Studio Google Cloud service-account credentials. "
+    "Groq is optional and only plans scenes."
 )
 
 with st.sidebar:
-    st.header("🔑 API keys")
-    gemini_key = st.text_input(
-        "Gemini API key (required)", type="password",
-        help="Your Google AI Studio key must have access to a supported Veo video model."
+    st.header("🔐 Google Cloud credentials")
+    project_id = st.text_input("Google Cloud Project ID")
+    bucket_name = st.text_input(
+        "Cloud Storage bucket name",
+        help="Create a Google Cloud Storage bucket in your project. Enter its name only, without gs://."
     )
-    groq_key = st.text_input(
-        "Groq API key (optional)", type="password",
-        help="Used only to expand your idea into scene prompts."
+    service_account_json = st.text_area(
+        "Service account JSON",
+        height=150,
+        placeholder='Paste the full JSON key for a Google Cloud service account',
+        help="Create a service account with Vertex AI User and permission to write/read objects in your bucket."
     )
     st.divider()
-    st.caption("Keys are entered for this session and are not stored by the app.")
+    st.header("Groq (optional)")
+    groq_key = st.text_input(
+        "Groq API key", type="password",
+        help="Used only to expand your idea into scene prompts."
+    )
+    st.caption("Credentials are used for this session only. Never commit them to GitHub.")
 
 left, right = st.columns([1.45, 1])
 with left:
@@ -59,7 +71,7 @@ with right:
     export_quality = st.selectbox("Export resolution", ["1080p HD", "2K (upscaled to 1440p)"])
     veo_model = st.selectbox(
         "Veo model",
-        ["veo-3.1-generate-preview", "veo-3.1-fast-generate-preview"]
+        ["veo-3.1-generate-001", "veo-3.1-fast-generate-001"]
     )
 
 st.caption(
@@ -93,7 +105,7 @@ Describe visible action and camera movement. Do not request text, subtitles,
 logos, or watermarks. Do not include markdown fences.
 """
     response = client.chat.completions.create(
-        model="openai/gpt-oss-120b",
+        model="llama-3.3-70b-versatile",
         messages=[{"role": "user", "content": instructions}],
         temperature=0.65,
     )
@@ -115,32 +127,121 @@ def get_ffmpeg():
     except Exception:
         return None
 
-def generate_veo_clip(client, prompt_text, model_name, aspect_ratio, destination, progress_callback):
-    # Veo API currently generates short clips; this workflow requests an 8-second clip.
-    config = types.GenerateVideosConfig(
-        aspect_ratio=aspect_ratio,
-        resolution="1080p",
-        duration_seconds=8,
-    )
-    operation = client.models.generate_videos(
-        model=model_name,
-        prompt=prompt_text,
-        config=config,
-    )
+def build_google_credentials(service_account_text: str, project: str):
+    """Create scoped Google Cloud credentials from the user's service-account JSON."""
+    try:
+        info = json.loads(service_account_text)
+    except json.JSONDecodeError as exc:
+        raise ValueError("The Service Account JSON is invalid. Paste the complete JSON key file.") from exc
 
-    while not operation.done:
-        time.sleep(10)
-        operation = client.operations.get(operation)
-        progress_callback()
+    if info.get("type") != "service_account":
+        raise ValueError("The JSON must be a Google Cloud service-account key, not a Google Cloud service-account credentials.")
 
-    response = operation.response
-    if not response or not response.generated_videos:
+    credentials = service_account.Credentials.from_service_account_info(
+        info,
+        scopes=["https://www.googleapis.com/auth/cloud-platform"],
+    )
+    return credentials
+
+
+def generate_veo_clip(
+    credentials,
+    project_id: str,
+    bucket_name: str,
+    prompt_text: str,
+    model_name: str,
+    aspect_ratio: str,
+    destination: Path,
+    progress_callback,
+):
+    """
+    Generate one 8-second Veo clip using the documented Vertex AI REST API.
+    Veo writes its result to the user's Cloud Storage bucket; this app downloads it.
+    """
+    session = AuthorizedSession(credentials)
+    location = "us-central1"
+    output_prefix = f"promptvideo-studio/{uuid.uuid4().hex}/"
+    output_gcs_uri = f"gs://{bucket_name}/{output_prefix}"
+
+    endpoint = (
+        f"https://{location}-aiplatform.googleapis.com/v1/"
+        f"projects/{project_id}/locations/{location}/publishers/google/models/"
+        f"{model_name}:predictLongRunning"
+    )
+    request_body = {
+        "instances": [{"prompt": prompt_text}],
+        "parameters": {
+            "storageUri": output_gcs_uri,
+            "sampleCount": 1,
+            "aspectRatio": aspect_ratio,
+            "durationSeconds": 8,
+            "resolution": "1080p",
+        },
+    }
+
+response = session.post(endpoint, json=request_body, timeout=120)
+    if response.status_code >= 400:
         raise RuntimeError(
-            "Veo returned no video. Check model access, API quota, billing, and safety filters."
+            f"Google Veo request failed ({response.status_code}): {response.text[:1800]}"
         )
 
-    video_file = response.generated_videos[0].video
-    client.files.download(file=video_file, download_path=str(destination))
+    operation_data = response.json()
+    operation_name = operation_data.get("name")
+    if not operation_name:
+        raise RuntimeError(f"Google did not return an operation name: {operation_data}")
+
+    poll_url = (
+        f"https://{location}-aiplatform.googleapis.com/v1/"
+        f"projects/{project_id}/locations/{location}/publishers/google/models/"
+        f"{model_name}:fetchPredictOperation"
+    )
+    while True:
+        time.sleep(15)
+        poll_response = session.post(
+            poll_url, json={"operationName": operation_name}, timeout=120
+        )
+        if poll_response.status_code >= 400:
+            raise RuntimeError(
+                f"Could not check Veo generation status ({poll_response.status_code}): "
+                f"{poll_response.text[:1500]}"
+            )
+        operation_data = poll_response.json()
+        progress_callback()
+        if operation_data.get("done"):
+            break
+
+    if operation_data.get("error"):
+        raise RuntimeError(f"Veo generation failed: {operation_data['error']}")
+
+    result = operation_data.get("response") or {}
+    video_uri = None
+
+    # REST response shape documented by Google is response.videos[].gcsUri.
+    videos = result.get("videos") or result.get("generatedVideos") or []
+    if videos:
+        first_video = videos[0]
+        video_uri = first_video.get("gcsUri")
+        if not video_uri and isinstance(first_video.get("video"), dict):
+            video_uri = first_video["video"].get("uri")
+
+    if not video_uri:
+        raise RuntimeError(
+            "Veo finished but did not return a video Cloud Storage URI. "
+            f"Response: {json.dumps(result)[:1500]}"
+        )
+
+    if not video_uri.startswith("gs://"):
+        raise RuntimeError(f"Unexpected Veo output URI: {video_uri}")
+
+# Download the generated object with the same service-account credentials.
+    storage_client = storage.Client(project=project_id, credentials=credentials)
+    bucket_part, blob_name = video_uri[5:].split("/", 1)
+    blob = storage_client.bucket(bucket_part).blob(blob_name)
+    blob.download_to_filename(str(destination))
+
+    if not destination.exists() or destination.stat().st_size == 0:
+        raise RuntimeError("The generated video file was empty or could not be downloaded.")
+
 
 def assemble_video(clip_paths, output_path, seconds, quality, portrait):
     ffmpeg = get_ffmpeg()
@@ -164,25 +265,26 @@ def assemble_video(clip_paths, output_path, seconds, quality, portrait):
         list_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
         command = [
-            ffmpeg,
-            "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
+            ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
             "-t", str(seconds),
-            "-vf",
-            f"scale={size}:force_original_aspect_ratio=decrease,"
-            f"pad={size}:(ow-iw)/2:(oh-ih)/2,setsar=1",
+            "-vf", f"scale={size}:force_original_aspect_ratio=decrease,"
+                   f"pad={size}:(ow-iw)/2:(oh-ih)/2,setsar=1",
             "-r", "24", "-c:v", "libx264", "-preset", "medium", "-crf", "18",
             "-pix_fmt", "yuv420p", "-c:a", "aac", "-b:a", "192k",
-            "-movflags", "+faststart", str(output_path),
+            "-movflags", "+faststart", str(output_path)
         ]
         result = subprocess.run(command, capture_output=True, text=True)
-        if result.returncode != 0:
+        if result.returncode:
             raise RuntimeError("FFmpeg export failed: " + result.stderr[-2000:])
 
 if st.button("🚀 Generate my video", type="primary", use_container_width=True):
     if not prompt.strip():
         st.error("Please enter a video prompt first.")
-    elif not gemini_key.strip():
-        st.error("A Gemini API key is required because Veo generates the video.")
+    elif not project_id.strip() or not bucket_name.strip() or not service_account_json.strip():
+        st.error(
+            "Enter your Google Cloud Project ID, Cloud Storage bucket name, "
+            "and service-account JSON. A standard Google AI Studio Gemini API key cannot authenticate this Veo workflow."
+        )
     else:
         scene_count = 3 if duration in (20, 24) else 4
         progress = st.progress(0)
@@ -196,7 +298,7 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                     st.markdown(f"**Scene {index}**")
                     st.write(scene)
 
-            client = genai.Client(api_key=gemini_key.strip())
+            credentials = build_google_credentials(service_account_json, project_id.strip())
             portrait = aspect.startswith("Portrait")
             aspect_ratio = "9:16" if portrait else "16:9"
 
@@ -213,7 +315,14 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                         progress.progress(min(0.78, (index + 0.2) / scene_count * 0.78))
 
                     generate_veo_clip(
-                        client, scene, veo_model, aspect_ratio, clip_path, poll_progress
+                        credentials,
+                        project_id.strip(),
+                        bucket_name.strip(),
+                        scene,
+                        veo_model,
+                        aspect_ratio,
+                        clip_path,
+                        poll_progress,
                     )
                     clips.append(str(clip_path))
                     progress.progress((index + 1) / scene_count * 0.78)
@@ -223,7 +332,7 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                 assemble_video(clips, final_path, duration, export_quality, portrait)
                 video_data = final_path.read_bytes()
 
-            progress.progress(1.0)
+progress.progress(1.0)
             status.success(f"Your {duration}-second video is ready!")
             st.video(video_data)
             st.download_button(
@@ -241,21 +350,21 @@ if st.button("🚀 Generate my video", type="primary", use_container_width=True)
                 "Groq returned invalid JSON. Try again, or leave the Groq key blank "
                 "to use automatic scene prompts."
             )
-            
         except Exception as error:
             st.error(f"Video generation failed: {error}")
             st.info(
-                "Check that your Gemini API key has Veo access, the selected model is "
+                "Check that your Google Cloud service-account credentials has Veo access, the selected model is "
                 "available to your account, and billing/quota are enabled."
             )
 
 with st.expander("Important details before deployment"):
     st.markdown("""
-- **Gemini/Veo generates the video.** A Gemini API key alone does not guarantee Veo access; the key/project must have access to the selected Veo model and available quota.
+- **Veo generates the video through Google Cloud Gemini Enterprise Agent Platform / Vertex AI.** This version uses a Google Cloud service-account JSON key, project ID, and Cloud Storage bucket. A standard Google AI Studio Google Cloud service-account credentials is not accepted by this Veo workflow.
+- Enable the Vertex AI API for your Google Cloud project. Give the service account the Vertex AI User role and read/write access to the output Cloud Storage bucket.
 - **Groq is optional.** It writes connected scene prompts but cannot create video pixels.
 - The app joins independently generated clips. Character and action continuity may vary between clips.
 - **1080p** is requested from Veo. **2K** is an upscale to 2560×1440 (landscape) or 1440×2560 (portrait), not native 2K generation.
 - Video generation may incur API charges and take several minutes per clip.
 - Streamlit Cloud has resource and execution limits. Long-running generations may time out; a production app may need a background worker and object storage.
 - Never place API keys in source code or commit them to GitHub.
-""")   
+""")
